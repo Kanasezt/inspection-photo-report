@@ -1,7 +1,5 @@
 import io
-import os
 import re
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -68,29 +66,27 @@ def sanitize_filename_part(name: str) -> str:
     return cleaned[:80] if cleaned else "Inspector"
 
 
-
 def build_output_filename(inspector_name: str) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
     safe_name = sanitize_filename_part(inspector_name)
     return f"Inspection_Report_{date_str} ({safe_name}).xlsx"
 
 
-
 def resize_with_padding(uploaded_file, width_px: int, height_px: int) -> Image.Image:
     """Resize image to fit exact target box while preserving aspect ratio.
     Pads with white background so all images appear same size in Excel.
     """
+    uploaded_file.seek(0)
     img = Image.open(io.BytesIO(uploaded_file.getvalue()))
     img = ImageOps.exif_transpose(img)
 
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-
-    # Keep transparency clean if source has alpha
+    # Handle alpha first
     if img.mode == "RGBA":
         background = Image.new("RGB", img.size, "white")
         background.paste(img, mask=img.getchannel("A"))
         img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
 
     # Fit inside target and pad to exact size
     fitted = ImageOps.contain(img, (width_px, height_px), Image.Resampling.LANCZOS)
@@ -100,6 +96,16 @@ def resize_with_padding(uploaded_file, width_px: int, height_px: int) -> Image.I
     canvas.paste(fitted, (x, y))
     return canvas
 
+
+def pil_to_excel_image_bytes(pil_img: Image.Image) -> io.BytesIO:
+    """
+    Convert PIL image to BytesIO for openpyxl image insertion.
+    Important: return a live buffer object and keep it alive until wb.save().
+    """
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
 
 
 def generate_report_bytes(inspector_name: str, equipment_room: str, uploaded_images) -> bytes:
@@ -114,6 +120,9 @@ def generate_report_bytes(inspector_name: str, equipment_room: str, uploaded_ima
     # Copy Equipment / Room name to TOOL!G8
     ws["G8"] = equipment_room.strip()
 
+    # Keep image buffers alive until workbook save is finished
+    live_image_buffers = []
+
     # Insert images in order
     for idx, uploaded in enumerate(uploaded_images):
         if idx >= len(IMAGE_CELLS):
@@ -121,7 +130,11 @@ def generate_report_bytes(inspector_name: str, equipment_room: str, uploaded_ima
 
         cell = IMAGE_CELLS[idx]
         prepared = resize_with_padding(uploaded, IMG_WIDTH_PX, IMG_HEIGHT_PX)
-        xl_img = XLImage(prepared)
+
+        img_buffer = pil_to_excel_image_bytes(prepared)
+        live_image_buffers.append(img_buffer)
+
+        xl_img = XLImage(img_buffer)
         xl_img.width = IMG_WIDTH_PX
         xl_img.height = IMG_HEIGHT_PX
         ws.add_image(xl_img, cell)
